@@ -1,10 +1,6 @@
 using FinancialEconometricsTests, LossFunctions, DependentBootstrap
 
 
-
-
-numObs = 1000
-numEst = 5
 function testvarranking(numObs::Int, numEst::Int)
 	depFac = 0.5
 	vTrue = 1 + cumsum(0.02 * randn(numObs))
@@ -15,9 +11,9 @@ function testvarranking(numObs::Int, numEst::Int)
 	vProxy = Float64[ vTrue[n] + 0.1*vTrue[n]*(depFac*eCommon[n] + (1-depFac)*randn()) for n = 1:numObs ]
 	vEst = Array(Float64, numObs, numEst)
 	for k = 1:numEst
-		vEst[:, k] = Float64[ vTrue[n] + k*0.01*vTrue[n]*(depFac*eCommon[n] + (1-depFac)*randn()) for n = 1:numObs ]
+		vEst[:, k] = Float64[ vTrue[n] + k*0.005*vTrue[n]*(depFac*eCommon[n] + (1-depFac)*randn()) for n = 1:numObs ]
 	end
-	ldTrueQLIKE = lossdiff(vEst[:, 2:end], vec(vEst[:, 1]), vTrue, QLIKE())
+	ldTrueQLIKE = lossdiff(vEst[:, 2:end], vec(vEst[:, 1]), vTrue, QLIKEReverse())
 	ldTrueMSE = lossdiff(vEst[:, 2:end], vec(vEst[:, 1]), vTrue, SquaredLoss())
 	mean_ldTrueQLIKE = mean(ldTrueQLIKE, 1)
 	mean_ldTrueMSE = mean(ldTrueMSE, 1)
@@ -34,7 +30,7 @@ function testvarranking(numObs::Int, numEst::Int)
 		println("tail region vec = " * string(tailRegionAll[m]))
 		println("test stat vec = " * string(testStatAll[m]))
 		if typeof(methodVec[m]) == VarianceRankingPatton
-			if typeof(methodVec[m].lossFunction) == QLIKE
+			if typeof(methodVec[m].lossFunction) == QLIKEReverse
 				println("true stat vec = " * string(mean_ldTrueQLIKE))
 			elseif typeof(methodVec[m].lossFunction) == SquaredLoss
 				println("true stat vec = " * string(mean_ldTrueMSE))

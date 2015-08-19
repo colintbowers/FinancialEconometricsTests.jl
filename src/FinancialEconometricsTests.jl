@@ -57,7 +57,7 @@ type VarianceRankingPatton <: VarianceRanking
 	end
 end
 VarianceRankingPatton(lossFunc::LossFunction) = VarianceRankingPatton([1.0], lossFunc)
-VarianceRankingPatton() = VarianceRankingPatton([1.0], QLIKE())
+VarianceRankingPatton() = VarianceRankingPatton([1.0], QLIKEReverse())
 #Bowers, Heaton (2013)
 type VarianceRankingBH <: VarianceRanking
 	bootstrapParam::BootstrapParam
@@ -84,11 +84,11 @@ function Base.show(io::IO, x::VarianceRankingBH)
 	println(io, "    Bootstrap type = " * string(x.bootstrapParam.bootstrapMethod))
 	println(io, "    Cut-off = " * string(x.cutoff))
 end
-#variance ranking diebold-mariano methods
-function variance_ranking_dm{T<:Number}(xhat1::AbstractVector{T}, xhat2::AbstractVector{T}, proxy::AbstractVector{T}, varMethod::VarianceRankingPatton ; foreEvalMethod::DMMethod=DMBootstrap(length(proxy)), confLevel::Float64=0.05)
+#variance ranking diebold-mariano methods (you must use first method if you want to force location estimator other than mean)
+function variance_ranking_dm{T<:Number}(xhat1::AbstractVector{T}, xhat2::AbstractVector{T}, proxy::AbstractVector{T}, varMethod::VarianceRankingPatton ; foreEvalMethod::DMMethod=DMBootstrap(length(proxy)), confLevel::Float64=0.05, forceLocationEstimator::Bool=false)
 	pProxy = variance_ranking_patton_proxy(proxy, varMethod)
 	ld = lossdiff(xhat1[1:end-length(varMethod.forwardWeights)], xhat2[1:end-length(varMethod.forwardWeights)], pProxy, varMethod.lossFunction)
-	return(dm(ld, foreEvalMethod, confLevel=confLevel))
+	return(dm(ld, foreEvalMethod, confLevel=confLevel, forceLocationEstimator=forceLocationEstimator))
 end
 function variance_ranking_dm{T<:Number}(estim::AbstractMatrix{T}, proxy::AbstractVector{T}, varMethod::VarianceRankingPatton ; foreEvalMethod::DMMethod=DMBootstrap(length(proxy)), confLevel::Float64=0.05)
 	size(estim, 2) < 2 && error("Not enough input estimators")
@@ -107,26 +107,30 @@ function variance_ranking_dm{T<:Number}(xhat1::AbstractVector{T}, xhat2::Abstrac
 		xhat2 = xhat2[inds]
 		proxy = proxy[inds]
 	end
-	ldAdj = variance_ranking_BH_series(xhat1, xhat2, proxy)
-	update!(varMethod.bootstrapParam, numObsData=length(ldAdj), numObsResample=length(ldAdj), statistic=mean) #These elements of BootstrapParam are fixed
-	sVec = dbootstrapstatistic(ldAdj, varMethod.bootstrapParam)
-	sort!(sVec)
-	(pVal, tailRegion) = pvalue(sVec, 0.0)
-	return(pVal, tailRegion)
+	testStat = variance_ranking_BH_Adj(xhat1, xhat2, proxy)
+	blSeries = variance_ranking_BH_series(xhat1, xhat2, proxy)
+	dbootstrapblocklength!(blSeries, varMethod.bootstrapParam) #Determine the block length from our best guess of the appropriate time-series
+	update!(varMethod.bootstrapParam, numObsData=length(blSeries), numObsResample=length(blSeries)) #These elements of BootstrapParam are fixed
+	bootInds = dbootstrapindex(varMethod.bootstrapParam)
+	testStatBoot = Array(Float64, varMethod.bootstrapParam.numResample)
+	for n = 1:varMethod.bootstrapParam.numResample
+		testStatBoot[n] = variance_ranking_BH_Adj(xhat1[sub(bootInds, 1:size(bootInds, 1), n)], xhat2[sub(bootInds, 1:size(bootInds, 1), n)], proxy[sub(bootInds, 1:size(bootInds, 1), n)])
+	end
+	testStatBoot -= mean(testStatBoot) #centre empirical distribution on zero
+	sort!(testStatBoot)
+	(pVal, tailRegion) = pvalue(testStatBoot, testStat)
+	pVal > confLevel && (tailRegion = 0)
+	return(pVal, tailRegion, testStat)
 end
 function variance_ranking_dm{T<:Number}(estim::AbstractMatrix{T}, proxy::AbstractVector{T}, varMethod::VarianceRankingBH ; confLevel::Float64=0.05)
 	size(estim, 2) < 2 && error("Not enough input estimators")
 	pValVec = Array(Float64, size(estim, 2)-1)
 	tailRegionVec = Array(Int, size(estim, 2)-1)
+	testStatVec = Array(Float64, size(estim, 2)-1)
 	for k = 2:size(estim, 2)
-		(pValVec[k-1], tailRegionVec[k-1]) = variance_ranking_dm(estim[:, k], estim[:, 1], proxy, varMethod, confLevel=confLevel)
+		(pValVec[k-1], tailRegionVec[k-1], testStatVec[k-1]) = variance_ranking_dm(estim[:, k], estim[:, 1], proxy, varMethod, confLevel=confLevel)
 	end
-	ldAdj = Array(Vector{T}, size(estim, 2)-1)
-	for k = 2:size(estim, 2)
-		ldAdj[k-1] = variance_ranking_BH_series(estim[:, k], estim[:, 1], proxy)
-	end
-	ldAdjMean = [ mean(ldAdj[k]) for k = 1:length(ldAdj) ]
-	return(pValVec, tailRegionVec, ldAdjMean)
+	return(pValVec, tailRegionVec, testStatVec)
 end
 variance_ranking_dm{T<:Number}(estim::Vector{Vector{T}}, proxy::AbstractVector{T}, varMethod::VarianceRankingBH ; confLevel::Float64=0.05) = variance_ranking_dm(colArrToMat(estim), proxy, varMethod, confLevel=confLevel)
 #Non-exported function for calculating proxy from Patton (2011) "Data-based Ranking of Realized Volatility Estimators"
@@ -147,43 +151,46 @@ function variance_ranking_BH_series{T<:Number}(xhat1::AbstractVector{T}, xhat2::
 	mup = mean(proxy)
 	return([ (xhat1[n] - proxy[n])^2 - (xhat2[n] - proxy[n])^2 + 2*(xhat1[n] - mu1)*(proxy[n] - mup) - 2*(xhat2[n] - mu2)*(proxy[n] - mup) for n = 1:length(proxy) ])
 end
+variance_ranking_BH_Adj{T<:Number}(xhat1::AbstractVector{T}, xhat2::AbstractVector{T}, proxy::AbstractVector{T}) = convert(Float64, mean((xhat1 - proxy).^2 - (xhat2 - proxy).^2) + 2*(cov(xhat1, proxy) - cov(xhat2, proxy)))
 
 
 
-
-
-
-
+x = randn(100)
+x = x - mean(x)
+sort!(x)
+x
+y = -1.8
+i = searchsortedlast(x, y)
+i / (0.5*length(x))
 
 
 
 
 #Function for getting p-values from one-sided or two-sided statistical tests. Input can be eiter sorted vector of iid draws from relevant distribution, or an explicit distribution
 function pvalue{T<:Number}(xVec::Vector{T}, xObs::T; twoSided::Bool=true)
+	i = searchsortedlast(xVec, xObs)
 	if twoSided
-		i = searchsortedlast(xVec, xObs)
-		NHalf = 0.5 * length(xVec)
-		if i <= NHalf
-			tailRegion = 1
-			pv = i / NHalf
-		else
+		if xObs <= mean(xVec)
 			tailRegion = -1
-			pv = 2 - (i / NHalf)
+			pv = 2*(i/length(xVec))
+		else
+			tailRegion = 1
+			pv = 2*(1 - (i/length(xVec)))
 		end
 	else
 		tailRegion = 1
-		pv = 1 - (searchsortedlast(xVec, xObs) / length(xVec))
+		pv = 1 - (i/length(xVec))
 	end
 	return(pv, tailRegion)
 end
 function pvalue{T<:Number}(d::Distribution, xObs::T; twoSided::Bool=true)
 	if twoSided
 		if xObs < mean(d)
-			tailRegion = 1
+			tailRegion = -1
 			pv = 2*cdf(d, xObs)
 		else
-			tailRegion = -1
-			pv = 2*cdf(d, -1 * xObs)
+			tailRegion = 1
+			pv = 2*(1 - cdf(d, xObs))
 		end
 	else
 		tailRegion = 1
